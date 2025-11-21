@@ -1,0 +1,42 @@
+#!/bin/bash
+set -e
+
+# Stage the codebase
+
+# Usage: checkout-to-commit-title <commit-title>
+#  commit_title: Label to search for in commits. Must be surrounded by <> in the commit message to match
+#  repo_dir: Directory of the codebase repo
+
+# Note that this script much be run in context of the codebase repo.
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: checkout-to-commit-title <commit-title>"
+  echo "Example: checkout-to-commit-title deps-bump"
+  exit 1
+fi
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: checkout-to-commit-title <commit-title> <repo-dir>"
+  echo "Example: checkout-to-commit-title deps-bump ~/exercises"
+  exit 1
+fi
+
+commit_title="$1"
+repo_dir="$2"
+
+get_sha_for_commit_title() {
+  git log --format=format:%H --grep "<$commit_title>"
+}
+
+checkout_to_commit_title() {
+  commit_sha=$(get_sha_for_commit_title)
+  if [[ -z "$commit_sha" ]]; then
+    echo "COMMIT_TITLE '$commit_title' has no matching commit for this workshop."
+  else
+    echo "Checking out from git. Label (Git commit containing text): <$commit_title>, SHA: $commit_sha"
+    git checkout $commit_sha
+  fi
+}
+
+cd "$repo_dir"
+checkout_to_commit_title $commit_title

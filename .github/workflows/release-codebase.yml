@@ -1,0 +1,543 @@
+name: Create Release from Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump_type:
+        description: 'Version bump type (major, minor, patch, hotfix, or manual)'
+        required: true
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+          - hotfix
+          - manual
+      manual_version:
+        description: 'Manual version (e.g., v1.2.3 or v1.2.3-hf1). Required if version_bump_type is manual'
+        required: false
+        type: string
+      source_branch:
+        description: 'Source branch to release from (defaults to codebase-develop)'
+        required: false
+        type: string
+        default: 'codebase-develop'
+      protect_branch:
+        description: 'Lock/write-protect the branch after release'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  test-codebase:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0  # Fetch all history for complete git repository
+
+      - name: Fetch all branches
+        run: |
+          git fetch --all --prune
+
+      - name: Set up Java 21 LTS
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Determine source branch
+        id: determine_source
+        run: |
+          SOURCE_BRANCH="${{ github.event.inputs.source_branch }}"
+          if [ -z "$SOURCE_BRANCH" ]; then
+            SOURCE_BRANCH="codebase-develop"
+          fi
+
+          # Fetch all branches
+          git fetch --all
+
+          # Check if source branch exists
+          if ! git show-ref --verify --quiet refs/heads/"$SOURCE_BRANCH" && \
+             ! git show-ref --verify --quiet refs/remotes/origin/"$SOURCE_BRANCH"; then
+            echo "Error: Source branch '$SOURCE_BRANCH' does not exist"
+            exit 1
+          fi
+
+          echo "source_branch=$SOURCE_BRANCH" >> $GITHUB_OUTPUT
+          echo "✓ Testing source branch '$SOURCE_BRANCH'"
+
+      - name: Test codebase branch
+        run: |
+          SOURCE_BRANCH="${{ steps.determine_source.outputs.source_branch }}"
+          ./scripts/codebase/test-codebase "$SOURCE_BRANCH"
+
+  create-release:
+    runs-on: ubuntu-latest
+    needs: test-codebase
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0  # Fetch all history for complete git repository
+          token: ${{ secrets.CODEBASE_RELEASER_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Validate source branch exists
+        id: validate_source
+        run: |
+          SOURCE_BRANCH="${{ github.event.inputs.source_branch }}"
+          if [ -z "$SOURCE_BRANCH" ]; then
+            SOURCE_BRANCH="codebase-develop"
+          fi
+
+          # Fetch all branches
+          git fetch --all
+
+          # Check if source branch exists
+          if ! git show-ref --verify --quiet refs/heads/"$SOURCE_BRANCH" && \
+             ! git show-ref --verify --quiet refs/remotes/origin/"$SOURCE_BRANCH"; then
+            echo "Error: Source branch '$SOURCE_BRANCH' does not exist"
+            exit 1
+          fi
+
+          echo "source_branch=$SOURCE_BRANCH" >> $GITHUB_OUTPUT
+          echo "✓ Source branch '$SOURCE_BRANCH' found"
+
+      - name: Calculate release version
+        id: calculate_version
+        run: |
+          VERSION_BUMP_TYPE="${{ github.event.inputs.version_bump_type }}"
+          MANUAL_VERSION="${{ github.event.inputs.manual_version }}"
+          SOURCE_BRANCH="${{ steps.validate_source.outputs.source_branch }}"
+
+          if [ "$VERSION_BUMP_TYPE" = "manual" ]; then
+            if [ -z "$MANUAL_VERSION" ]; then
+              echo "Error: manual_version is required when version_bump_type is manual"
+              exit 1
+            fi
+            # Validate manual version format
+            if [[ ! "$MANUAL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-hf[0-9]+)?$ ]]; then
+              echo "Error: Invalid manual version format. Expected: vM.m.p or vM.m.p-hfN"
+              exit 1
+            fi
+            RELEASE_VERSION="$MANUAL_VERSION"
+            RELEASE_BRANCH="codebase-release-$MANUAL_VERSION"
+          else
+            # Fetch all remote branches to detect existing versions
+            git fetch --all
+
+            # Find all existing codebase-release-v* branches (including hotfix versions)
+            EXISTING_BRANCHES=$(git branch -r | grep -E 'origin/codebase-release-v[0-9]+\.[0-9]+\.[0-9]+(-hf[0-9]+)?$' | sed 's|origin/codebase-release-||' | sort -V)
+
+            if [ -z "$EXISTING_BRANCHES" ]; then
+              # No existing releases, start at v1.0.0
+              case "$VERSION_BUMP_TYPE" in
+                major) RELEASE_VERSION="v1.0.0" ;;
+                minor) RELEASE_VERSION="v1.0.0" ;;
+                patch) RELEASE_VERSION="v1.0.0" ;;
+                hotfix) RELEASE_VERSION="v1.0.0-hf1" ;;
+                *) echo "Error: Invalid version_bump_type: $VERSION_BUMP_TYPE"; exit 1 ;;
+              esac
+            else
+              if [ "$VERSION_BUMP_TYPE" = "hotfix" ]; then
+                # For hotfix, use the latest version (including hotfix versions)
+                LATEST_VERSION=$(echo "$EXISTING_BRANCHES" | tail -n1 | xargs)
+
+                # Parse version components
+                if [[ "$LATEST_VERSION" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-hf([0-9]+))?$ ]]; then
+                  MAJOR="${BASH_REMATCH[1]}"
+                  MINOR="${BASH_REMATCH[2]}"
+                  PATCH="${BASH_REMATCH[3]}"
+                  HOTFIX="${BASH_REMATCH[5]}"
+
+                  if [ -n "$HOTFIX" ]; then
+                    HOTFIX=$((HOTFIX + 1))
+                  else
+                    HOTFIX=1
+                  fi
+
+                  RELEASE_VERSION="v${MAJOR}.${MINOR}.${PATCH}-hf${HOTFIX}"
+                else
+                  echo "Error: Could not parse latest version: $LATEST_VERSION"
+                  exit 1
+                fi
+              else
+                # For major/minor/patch, find the latest base version (without hotfix)
+                # Extract base versions (remove hotfix suffix) and get the latest
+                BASE_VERSIONS=$(echo "$EXISTING_BRANCHES" | sed 's/-hf[0-9]*$//' | sort -u -V)
+                LATEST_BASE_VERSION=$(echo "$BASE_VERSIONS" | tail -n1 | xargs)
+
+                # Parse version components
+                if [[ "$LATEST_BASE_VERSION" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                  MAJOR="${BASH_REMATCH[1]}"
+                  MINOR="${BASH_REMATCH[2]}"
+                  PATCH="${BASH_REMATCH[3]}"
+
+                  case "$VERSION_BUMP_TYPE" in
+                    major)
+                      MAJOR=$((MAJOR + 1))
+                      MINOR=0
+                      PATCH=0
+                      ;;
+                    minor)
+                      MINOR=$((MINOR + 1))
+                      PATCH=0
+                      ;;
+                    patch)
+                      PATCH=$((PATCH + 1))
+                      ;;
+                    *)
+                      echo "Error: Invalid version_bump_type: $VERSION_BUMP_TYPE"
+                      exit 1
+                      ;;
+                  esac
+
+                  RELEASE_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+                else
+                  echo "Error: Could not parse latest base version: $LATEST_BASE_VERSION"
+                  exit 1
+                fi
+              fi
+            fi
+
+            RELEASE_BRANCH="codebase-release-$RELEASE_VERSION"
+          fi
+
+          # Check if release branch already exists
+          if git show-ref --verify --quiet refs/heads/"$RELEASE_BRANCH" || \
+             git show-ref --verify --quiet refs/remotes/origin/"$RELEASE_BRANCH"; then
+            echo "Error: Release branch '$RELEASE_BRANCH' already exists"
+            exit 1
+          fi
+
+          echo "release_version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+          echo "release_branch=$RELEASE_BRANCH" >> $GITHUB_OUTPUT
+          echo "✓ Calculated release version: $RELEASE_VERSION"
+          echo "✓ Release branch will be: $RELEASE_BRANCH"
+
+      - name: Create release branch from source branch
+        id: create_release_branch
+        run: |
+          SOURCE_BRANCH="${{ steps.validate_source.outputs.source_branch }}"
+          RELEASE_BRANCH="${{ steps.calculate_version.outputs.release_branch }}"
+          RELEASE_VERSION="${{ steps.calculate_version.outputs.release_version }}"
+
+          # Ensure we have the source branch locally
+          if ! git show-ref --verify --quiet refs/heads/"$SOURCE_BRANCH"; then
+            git checkout -b "$SOURCE_BRANCH" "origin/$SOURCE_BRANCH" 2>/dev/null || \
+            git checkout "$SOURCE_BRANCH"
+          else
+            git checkout "$SOURCE_BRANCH"
+          fi
+
+          # Get all commits from source branch
+          ALL_COMMITS=$(git rev-list --reverse "$SOURCE_BRANCH")
+
+          if [ -z "$ALL_COMMITS" ]; then
+            echo "Warning: No commits found in source branch '$SOURCE_BRANCH'"
+            COMMITS=""
+          else
+            COMMITS="$ALL_COMMITS"
+          fi
+
+          # Create orphaned branch with empty commit
+          echo "Creating orphaned branch '$RELEASE_BRANCH' with empty commit..."
+          git checkout --orphan "$RELEASE_BRANCH"
+          git rm -rf . 2>/dev/null || true  # Remove all files if any exist
+
+          # Count total commits for progress
+          TOTAL_COMMITS=$(echo "$COMMITS" | wc -l | tr -d ' ')
+          CURRENT=0
+
+          # Cherry-pick each commit
+          if [ -n "$COMMITS" ]; then
+            echo "Cherry-picking $TOTAL_COMMITS commits from '$SOURCE_BRANCH'..."
+            for commit in $COMMITS; do
+              CURRENT=$((CURRENT + 1))
+              echo "[$CURRENT/$TOTAL_COMMITS] Cherry-picking $commit..."
+
+              if ! git cherry-pick "$commit"; then
+                echo "Error: Failed to cherry-pick commit $commit"
+                echo "You may need to resolve conflicts manually and continue with: git cherry-pick --continue"
+                exit 1
+              fi
+            done
+            echo "Successfully cherry-picked all commits!"
+          else
+            echo "No commits to cherry-pick (target branch only contains empty commit)"
+          fi
+
+          # Get the final commit SHA
+          RELEASE_COMMIT=$(git rev-parse HEAD)
+          echo "commit=$RELEASE_COMMIT" >> $GITHUB_OUTPUT
+          echo "✓ Release branch '$RELEASE_BRANCH' created successfully!"
+          echo "  Final commit: $RELEASE_COMMIT"
+
+      - name: Tag release branch and push
+        id: tag_release
+        run: |
+          RELEASE_BRANCH="${{ steps.calculate_version.outputs.release_branch }}"
+          RELEASE_VERSION="${{ steps.calculate_version.outputs.release_version }}"
+          RELEASE_COMMIT="${{ steps.create_release_branch.outputs.commit }}"
+
+          # Ensure we're on the release branch
+          git checkout "$RELEASE_BRANCH"
+
+          # Create tag on the last commit of release branch
+          git tag -f "$RELEASE_VERSION" "$RELEASE_COMMIT"
+          echo "Created tag '$RELEASE_VERSION' on release branch HEAD: $RELEASE_COMMIT"
+
+          # Push the release branch and tag to remote
+          git push origin "$RELEASE_BRANCH"
+          git push origin "$RELEASE_VERSION" || echo "Tag may already exist on remote"
+          echo "✓ Release branch '$RELEASE_BRANCH' and tag '$RELEASE_VERSION' pushed to remote"
+
+      - name: Create clean standalone repository with only release branch
+        run: |
+          RELEASE_BRANCH="${{ steps.calculate_version.outputs.release_branch }}"
+          RELEASE_VERSION="${{ steps.calculate_version.outputs.release_version }}"
+          CLEAN_REPO_DIR="$RUNNER_TEMP/clean-repo"
+
+          # Ensure we're on the release branch
+          git checkout "$RELEASE_BRANCH"
+
+          # Get the commit SHA of the release branch HEAD
+          RELEASE_COMMIT=$(git rev-parse HEAD)
+          echo "Release branch HEAD: $RELEASE_COMMIT"
+
+          # Create a completely fresh repository with only the release branch
+          mkdir -p "$CLEAN_REPO_DIR"
+          cd "$CLEAN_REPO_DIR"
+
+          # Initialize new bare repository
+          git init --bare repo.git
+          cd repo.git
+
+          # Add the original repo as a remote temporarily
+          git remote add source "$GITHUB_WORKSPACE"
+
+          # Fetch only the release branch with full history
+          git fetch source "$RELEASE_BRANCH:$RELEASE_BRANCH" --depth=2147483647
+
+          # Fetch the tag we just created
+          git fetch source "$RELEASE_VERSION:$RELEASE_VERSION" 2>/dev/null || true
+
+          # Remove the temporary remote
+          git remote remove source
+
+          # Clone the bare repo to a working directory
+          cd ..
+          git clone repo.git repo
+          cd repo
+          git checkout "$RELEASE_BRANCH"
+
+          # Remove all remotes
+          git remote remove origin 2>/dev/null || true
+
+          # Remove all branches except the target branch
+          git branch | sed 's/^[* ] //' | grep -v "^$RELEASE_BRANCH$" | while read branch; do
+            git branch -D "$branch" 2>/dev/null || true
+          done
+
+          # Remove all remote refs
+          rm -rf .git/refs/remotes
+
+          # Clean up packed-refs to remove all remotes and other branches
+          if [ -f .git/packed-refs ]; then
+            grep -v "refs/remotes/" .git/packed-refs | \
+            awk -v branch="$RELEASE_BRANCH" -v tag="$RELEASE_VERSION" '
+              /^#/ { print; next }
+              /refs\/tags\/'"$tag"'$/ { print; next }
+              /refs\/heads\/'"$branch"'$/ { print; next }
+              /refs\/heads\// { next }
+              { print }
+            ' > .git/packed-refs.tmp 2>/dev/null && \
+            mv .git/packed-refs.tmp .git/packed-refs || rm -f .git/packed-refs.tmp
+          fi
+
+          # Remove all other branch refs
+          find .git/refs/heads -type f ! -name "$RELEASE_BRANCH" -delete 2>/dev/null || true
+
+          # Clean up config
+          git config --remove-section remote.origin 2>/dev/null || true
+
+          # Remove reflog entries that might reference other branches
+          rm -rf .git/logs/refs/remotes
+          find .git/logs/refs/heads -type f ! -name "$RELEASE_BRANCH" -delete 2>/dev/null || true
+
+          # Copy the cleaned repository back to workspace
+          cd "$GITHUB_WORKSPACE"
+          rm -rf .git
+          cp -a "$CLEAN_REPO_DIR/repo/.git" .git
+          git checkout -B "$RELEASE_BRANCH" HEAD
+          git reset --hard HEAD
+
+          # Clean up temp directory
+          rm -rf "$CLEAN_REPO_DIR"
+
+          # Verify we have a clean standalone repository
+          echo "Repository cleaned:"
+          echo "  Current branch: $(git branch --show-current)"
+          echo "  Local branches: $(git branch | wc -l)"
+          echo "  Remotes: $(git remote | wc -l || echo 0)"
+          echo "  HEAD commit: $(git rev-parse HEAD)"
+
+      - name: Create repository archive (tar.gz)
+        run: |
+          ARCHIVE_NAME="repository-${{ steps.calculate_version.outputs.release_version }}.tar.gz"
+          TEMP_DIR="$RUNNER_TEMP/repo-archive-tar"
+          ARCHIVE_PATH="$GITHUB_WORKSPACE/$ARCHIVE_NAME"
+
+          # Copy repository to temp directory to avoid "file changed as we read it" errors
+          mkdir -p "$TEMP_DIR"
+          cp -a . "$TEMP_DIR/repo"
+
+          # Create complete git repository archive including .git directory
+          # Exclude archive files, workflow files, and source artifacts that reference main
+          cd "$TEMP_DIR/repo"
+          tar -czf "$ARCHIVE_PATH" \
+            --exclude='.github/workflows' \
+            --exclude='*.tar.gz' \
+            --exclude='*.zip' \
+            --exclude='.git/logs/refs/remotes' \
+            --exclude='.git/refs/remotes' \
+            .
+
+          cd "$GITHUB_WORKSPACE"
+          rm -rf "$TEMP_DIR"
+
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          ls -lh "$ARCHIVE_NAME"
+
+      - name: Create repository archive (zip)
+        run: |
+          ARCHIVE_NAME="repository-${{ steps.calculate_version.outputs.release_version }}.zip"
+          TEMP_DIR="$RUNNER_TEMP/repo-archive-zip"
+          ARCHIVE_PATH="$GITHUB_WORKSPACE/$ARCHIVE_NAME"
+
+          # Copy repository to temp directory to avoid "file changed as we read it" errors
+          mkdir -p "$TEMP_DIR"
+          cp -a . "$TEMP_DIR/repo"
+
+          # Create complete git repository archive including .git directory
+          # Exclude archive files, workflow files, and source artifacts that reference main
+          cd "$TEMP_DIR/repo"
+          zip -r "$ARCHIVE_PATH" . \
+            -x ".github/workflows/*" \
+            -x "*.tar.gz" \
+            -x "*.zip" \
+            -x ".git/logs/refs/remotes/*" \
+            -x ".git/refs/remotes/*"
+
+          cd "$GITHUB_WORKSPACE"
+          rm -rf "$TEMP_DIR"
+
+          echo "ZIP_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          ls -lh "$ARCHIVE_NAME"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.calculate_version.outputs.release_version }}
+          target_commitish: ${{ steps.create_release_branch.outputs.commit }}
+          name: Release ${{ steps.calculate_version.outputs.release_version }}
+          body: |
+            Release artifacts for branch `${{ steps.calculate_version.outputs.release_branch }}`
+
+            This release contains the complete git repository as tar.gz and zip archives.
+          files: |
+            repository-${{ steps.calculate_version.outputs.release_version }}.tar.gz
+            repository-${{ steps.calculate_version.outputs.release_version }}.zip
+          draft: false
+          prerelease: false
+
+      - name: Protect/Lock branch
+        if: ${{ github.event.inputs.protect_branch == 'true' }}
+        run: |
+          RELEASE_BRANCH="${{ steps.calculate_version.outputs.release_branch }}"
+
+          # Check if branch exists on remote
+          echo "Checking if branch '$RELEASE_BRANCH' exists on remote..."
+          BRANCH_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: token ${{ secrets.CODEBASE_RELEASER_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/branches/$RELEASE_BRANCH")
+
+          HTTP_CODE=$(echo "$BRANCH_RESPONSE" | tail -n1)
+          BRANCH_BODY=$(echo "$BRANCH_RESPONSE" | head -n-1)
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Error: Branch '$RELEASE_BRANCH' does not exist on remote (HTTP $HTTP_CODE)"
+            echo "Response: $BRANCH_BODY"
+            echo "Please push the branch first before protecting it."
+            exit 1
+          fi
+
+          echo "✓ Branch '$RELEASE_BRANCH' exists on remote"
+
+          # Check if PAT token is available
+          if [ -z "${{ secrets.CODEBASE_RELEASER_TOKEN }}" ]; then
+            echo "⚠ Warning: CODEBASE_RELEASER_TOKEN secret not found"
+            echo "Branch protection requires a PAT with admin access."
+            echo "Please add CODEBASE_RELEASER_TOKEN as a repository secret."
+            echo "Continuing without branch protection..."
+            exit 0
+          fi
+
+          # Create or update branch protection rule using PAT
+          echo "Setting up branch protection for '$RELEASE_BRANCH' using PAT..."
+          PROTECTION_RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
+            -H "Authorization: token ${{ secrets.CODEBASE_RELEASER_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/branches/$RELEASE_BRANCH/protection" \
+            -d '{
+              "required_status_checks": null,
+              "enforce_admins": true,
+              "required_pull_request_reviews": null,
+              "restrictions": null,
+              "allow_force_pushes": false,
+              "allow_deletions": false,
+              "lock_branch": true
+            }')
+
+          PROTECTION_HTTP_CODE=$(echo "$PROTECTION_RESPONSE" | tail -n1)
+          PROTECTION_BODY=$(echo "$PROTECTION_RESPONSE" | head -n-1)
+
+          if [ "$PROTECTION_HTTP_CODE" = "200" ]; then
+            echo "✓ Branch '$RELEASE_BRANCH' has been protected and locked"
+          elif [ "$PROTECTION_HTTP_CODE" = "204" ]; then
+            echo "✓ Branch '$RELEASE_BRANCH' protection updated (no content returned)"
+          elif [ "$PROTECTION_HTTP_CODE" = "403" ]; then
+            echo "⚠ Warning: Permission denied (HTTP 403) - Branch protection not set"
+            echo "The CODEBASE_RELEASER_TOKEN may not have the required scopes or the user may not have admin access."
+            echo "Ensure the PAT has 'repo' and 'admin:repo_hook' scopes and the user has admin permissions on the repository."
+            echo "Response: $PROTECTION_BODY"
+            echo "Continuing without branch protection..."
+            exit 0
+          elif [ "$PROTECTION_HTTP_CODE" = "404" ]; then
+            echo "⚠ Warning: Branch protection API not found (HTTP 404) - Branch protection not set"
+            echo "This may indicate the repository doesn't support branch protection or the API endpoint is incorrect."
+            echo "Response: $PROTECTION_BODY"
+            echo "Continuing without branch protection..."
+            exit 0
+          else
+            echo "⚠ Warning: Failed to protect branch (HTTP $PROTECTION_HTTP_CODE) - Branch protection not set"
+            echo "Response: $PROTECTION_BODY"
+            echo "Continuing without branch protection..."
+            exit 0
+          fi

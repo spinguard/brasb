@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: git-edit-commit-by-title <title-substring>"
+  echo "Example: git-edit-commit-by-title deps-bump"
+  exit 1
+fi
+
+title_substring="$1"
+
+# Find commits whose subject starts with <...>
+# and extract SHA + the title inside angle brackets
+matches=$(git log --pretty=format:'%H %s' \
+  | sed -nE 's/^([0-9a-fA-F]+) <([^>]+)>.*/\1 \2/p' \
+  | grep -F "$title_substring" || true)
+
+if [[ -z "$matches" ]]; then
+  echo "Error: No commit found with title matching substring: $title_substring"
+  exit 1
+fi
+
+# Extract SHA(s)
+commit_shas=$(echo "$matches" | awk '{print $1}')
+count=$(echo "$commit_shas" | wc -w)
+
+if [[ "$count" -ne 1 ]]; then
+  echo "Error: Title substring is not unique!"
+  echo "Matched commits:"
+  echo "$matches"
+  exit 1
+fi
+
+commit_sha="$commit_shas"
+
+# Parent SHA
+parent_sha=$(git rev-parse "$commit_sha^")
+
+echo "Matched commit:"
+git --no-pager log -1 "$commit_sha"
+echo
+echo "Parent for rebase: $parent_sha"
+echo
+
+# Perform the non-interactive rebase with auto-edit
+GIT_SEQUENCE_EDITOR="sed -i \"s/pick $commit_sha/edit $commit_sha/\"" \
+  git rebase -i "$parent_sha"

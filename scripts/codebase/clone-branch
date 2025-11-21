@@ -1,0 +1,79 @@
+#!/bin/bash
+
+# Script to clone a branch by creating an orphaned branch and cherry-picking all commits
+# Usage: ./clone_branch.sh <target_branch> <source_branch>
+
+set -e  # Exit on error
+
+# Check if correct number of arguments provided
+if [ $# -ne 2 ]; then
+    echo "Error: Invalid number of arguments"
+    echo "Usage: $0 <target_branch> <source_branch>"
+    exit 1
+fi
+
+TARGET_BRANCH="$1"
+SOURCE_BRANCH="$2"
+
+# Check if we're in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    echo "Error: Not in a git repository"
+    exit 1
+fi
+
+# Check if target branch already exists
+if git show-ref --verify --quiet refs/heads/"$TARGET_BRANCH"; then
+    echo "Error: Branch '$TARGET_BRANCH' already exists"
+    exit 1
+fi
+
+# Check if source branch exists
+if ! git show-ref --verify --quiet refs/heads/"$SOURCE_BRANCH"; then
+    echo "Error: Source branch '$SOURCE_BRANCH' does not exist"
+    exit 1
+fi
+
+# Get all commits from source branch
+ALL_COMMITS=$(git rev-list --reverse "$SOURCE_BRANCH")
+
+if [ -z "$ALL_COMMITS" ]; then
+    echo "Warning: No commits found in source branch '$SOURCE_BRANCH'"
+    COMMITS=""
+else
+    COMMITS="$ALL_COMMITS"
+fi
+
+# Create orphaned branch with empty commit
+echo "Creating orphaned branch '$TARGET_BRANCH' with empty commit..."
+git checkout --orphan "$TARGET_BRANCH"
+git rm -rf . 2>/dev/null || true  # Remove all files if any exist
+git commit --allow-empty -m "Initial empty commit"
+
+# Count total commits for progress
+TOTAL_COMMITS=$(echo "$COMMITS" | wc -l | tr -d ' ')
+CURRENT=0
+
+# Cherry-pick each commit
+if [ -n "$COMMITS" ]; then
+    echo "Cherry-picking $TOTAL_COMMITS commits from '$SOURCE_BRANCH'..."
+    for commit in $COMMITS; do
+        CURRENT=$((CURRENT + 1))
+        echo "[$CURRENT/$TOTAL_COMMITS] Cherry-picking $commit..."
+
+        if ! git cherry-pick "$commit"; then
+            echo "Error: Failed to cherry-pick commit $commit"
+            echo "You may need to resolve conflicts manually and continue with: git cherry-pick --continue"
+            exit 1
+        fi
+    done
+    echo "Successfully cherry-picked all commits!"
+else
+    echo "No commits to cherry-pick (target branch only contains empty commit)"
+fi
+
+echo "Branch '$TARGET_BRANCH' created successfully!"
+
+# Switch back to main branch
+echo "Switching back to main branch..."
+git checkout main
+echo "Current branch: $(git branch --show-current)"

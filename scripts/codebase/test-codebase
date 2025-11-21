@@ -1,0 +1,129 @@
+#!/bin/bash
+
+# Script to test a codebase branch by building at each commit
+# Usage: ./test-codebase [branch-name]
+#  branch-name: Name of the codebase branch to test (default: codebase-develop)
+
+set -e  # Exit on error
+
+BRANCH_NAME="${1:-codebase-develop}"
+
+# Check if we're in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    echo "Error: Not in a git repository"
+    exit 1
+fi
+
+# Check if branch exists (local or remote)
+if ! git show-ref --verify --quiet refs/heads/"$BRANCH_NAME" && \
+   ! git show-ref --verify --quiet refs/remotes/origin/"$BRANCH_NAME"; then
+    echo "Error: Branch '$BRANCH_NAME' does not exist"
+    exit 1
+fi
+
+# Save current branch
+CURRENT_BRANCH=$(git branch --show-current)
+CURRENT_COMMIT=$(git rev-parse HEAD)
+
+# Function to restore original state on exit
+cleanup() {
+    echo ""
+    echo "Restoring original state..."
+    git checkout "$CURRENT_BRANCH" > /dev/null 2>&1 || true
+    git reset --hard "$CURRENT_COMMIT" > /dev/null 2>&1 || true
+}
+
+# Set trap to cleanup on exit
+trap cleanup EXIT
+
+echo "Testing codebase branch: $BRANCH_NAME"
+echo "======================================"
+echo ""
+
+# Checkout the branch (create local tracking branch if it's only on remote)
+echo "Checking out branch '$BRANCH_NAME'..."
+if git show-ref --verify --quiet refs/heads/"$BRANCH_NAME"; then
+    git checkout "$BRANCH_NAME"
+elif git show-ref --verify --quiet refs/remotes/origin/"$BRANCH_NAME"; then
+    # Branch only exists on remote, create local tracking branch
+    git checkout -b "$BRANCH_NAME" "origin/$BRANCH_NAME"
+else
+    echo "Error: Cannot checkout branch '$BRANCH_NAME'"
+    exit 1
+fi
+
+# Check if gradlew exists (after checkout, since it's part of the codebase)
+if [ ! -f "./gradlew" ]; then
+    echo "Error: gradlew not found in branch '$BRANCH_NAME'"
+    exit 1
+fi
+
+# Get all commits in reverse order (oldest first)
+ALL_COMMITS=$(git rev-list --reverse "$BRANCH_NAME")
+
+if [ -z "$ALL_COMMITS" ]; then
+    echo "Error: No commits found in branch '$BRANCH_NAME'"
+    exit 1
+fi
+
+# Count total commits
+TOTAL_COMMITS=$(echo "$ALL_COMMITS" | wc -l | tr -d ' ')
+echo "Found $TOTAL_COMMITS commits to test"
+echo ""
+
+# Get the first commit (initial commit)
+FIRST_COMMIT=$(echo "$ALL_COMMITS" | head -n 1)
+echo "Resetting to initial commit: $FIRST_COMMIT"
+git reset --hard "$FIRST_COMMIT"
+
+# Test the initial commit
+CURRENT=0
+CURRENT=$((CURRENT + 1))
+COMMIT_MSG=$(git log -1 --format="%s" "$FIRST_COMMIT")
+echo ""
+echo "[$CURRENT/$TOTAL_COMMITS] Testing commit: $FIRST_COMMIT"
+echo "  Message: $COMMIT_MSG"
+echo "  Running: ./gradlew clean build"
+
+if ! ./gradlew clean build; then
+    echo ""
+    echo "❌ BUILD FAILED at commit $CURRENT/$TOTAL_COMMITS"
+    echo "   Commit: $FIRST_COMMIT"
+    echo "   Message: $COMMIT_MSG"
+    exit 1
+fi
+
+echo "  ✓ Build successful"
+echo ""
+
+# Iterate through remaining commits
+REMAINING_COMMITS=$(echo "$ALL_COMMITS" | tail -n +2)
+
+for commit in $REMAINING_COMMITS; do
+    CURRENT=$((CURRENT + 1))
+    COMMIT_MSG=$(git log -1 --format="%s" "$commit")
+
+    echo "[$CURRENT/$TOTAL_COMMITS] Testing commit: $commit"
+    echo "  Message: $COMMIT_MSG"
+    echo "  Fast-forwarding to commit..."
+
+    # Fast-forward to the commit
+    git reset --hard "$commit"
+
+    echo "  Running: ./gradlew clean build"
+
+    if ! ./gradlew clean build; then
+        echo ""
+        echo "❌ BUILD FAILED at commit $CURRENT/$TOTAL_COMMITS"
+        echo "   Commit: $commit"
+        echo "   Message: $COMMIT_MSG"
+        exit 1
+    fi
+
+    echo "  ✓ Build successful"
+    echo ""
+done
+
+echo "======================================"
+echo "✅ All commits tested successfully!"
+echo "   Tested $TOTAL_COMMITS commits on branch '$BRANCH_NAME'"

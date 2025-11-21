@@ -19,3 +19,7 @@
 .yarn
 .envrc
 .vscode
+
+# Gradle
+build
+.gradle

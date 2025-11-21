@@ -1,0 +1,36 @@
+#!/bin/bash
+
+# Script to create a new orphaned branch with an empty commit
+# Usage: ./new_empty_branch.sh <branch_name>
+
+set -e  # Exit on error
+
+# Check if correct number of arguments provided
+if [ $# -ne 1 ]; then
+    echo "Error: Invalid number of arguments"
+    echo "Usage: $0 <branch_name>"
+    exit 1
+fi
+
+BRANCH_NAME="$1"
+
+# Check if we're in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    echo "Error: Not in a git repository"
+    exit 1
+fi
+
+# Check if branch already exists
+if git show-ref --verify --quiet refs/heads/"$BRANCH_NAME"; then
+    echo "Error: Branch '$BRANCH_NAME' already exists"
+    exit 1
+fi
+
+# Create orphaned branch, empty the workspace
+echo "Creating orphaned branch '$BRANCH_NAME' with empty commit..."
+git checkout --orphan "$BRANCH_NAME"
+git rm -rf . 2>/dev/null || true  # Remove all files if any exist
+
+echo "Branch '$BRANCH_NAME' created successfully!"
+echo "Current branch: $(git branch --show-current)"
+echo "You need to add some files to the branch before you can commit them."
